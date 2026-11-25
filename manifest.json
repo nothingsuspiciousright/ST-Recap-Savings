@@ -1,12 +1,10 @@
 {
   "display_name": "Recap Savings",
   "loading_order": 100,
-  "requires": [
-    "regex"
-  ],
+  "requires": [],
   "optional": [],
   "js": "index.js",
   "css": "style.css",
   "author": "nothingsuspiciousright",
-  "version": "1.0.1"
+  "version": "1.0.2"
 }
