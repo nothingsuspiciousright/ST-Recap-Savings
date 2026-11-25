@@ -1,0 +1,12 @@
+.sola-recap-savings {
+    display: inline-block;
+    margin-inline-start: .45em;
+    color: var(--SmartThemeQuoteColor, #8dbfa4);
+    opacity: .85;
+    font-size: .78em;
+    font-variant-numeric: tabular-nums;
+    font-weight: 400;
+    white-space: nowrap;
+    vertical-align: baseline;
+    pointer-events: auto;
+}
