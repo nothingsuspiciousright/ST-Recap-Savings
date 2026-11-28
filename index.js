@@ -1,148 +1,148 @@
-// ST-Recap-Savings: mobile-compatible UI and explicit diagnostics.
-// Read-only comparison. Never edits chat, prompt or regex settings.
+import { is_send_press } from '../../../../script.js';
+import { is_group_generating } from '../../../group-chats.js';
+import { getRegexScripts, runRegexScript } from '../../regex/engine.js';
+import { countTokensOpenAIAsync, getTokenizerModel } from '../../../tokenizers.js';
+import { applicable, compare, compact, isSaver } from './core.js';
+
 const SELECTOR = '[data-pm-identifier="chatHistory"]';
 const BADGE = 'sola-recap-savings';
-const VERSION = '1.0.3';
-const isSaver = s => s.id === 'd9c82f13-b5d0-4286-b5bb-a0b3835c4013' || /\bSaver:\s*Russian Narrative\b/i.test(s.scriptName || '');
-const applicable = (s,d) => !s.disabled && !!s.promptOnly && s.placement?.includes(2) && !(s.minDepth != null && Number(s.minDepth) >= -1 && d < Number(s.minDepth)) && !(s.maxDepth != null && Number(s.maxDepth) >= 0 && d > Number(s.maxDepth));
-const compact = n => n < 1000 ? String(n) : `${Number((n / 1000).toFixed(n < 10000 ? 1 : 0))}k`;
-const visible = el => !!el?.isConnected && !!el.getClientRects().length && !document.hidden && getComputedStyle(el).visibility !== 'hidden';
-const row = () => [...document.querySelectorAll(SELECTOR)].find(visible);
-const cache = new Map();
-let deps, loading, timer, busy = false, pending = false, revision = 0, lastRow, wasGenerating = false, session = '', lastResult, lastSignature = '', lastMessages = [], status = {label:'Loading…', detail:'Starting Recap Savings'};
-const errorText = e => String(e?.message || e?.statusText || e || 'Unknown error').slice(0,200);
-const generating = () => !!(deps?.main?.is_send_press || deps?.group?.is_group_generating);
-function render(el = row()) {
-    if (!el) return;
+const cache = new Map(); // only in memory, keyed by current chat and post index
+let session = '', timer, busy = false, revision = 0, pending = false;
+const generating = () => is_send_press || is_group_generating;
+let lastRow = null, lastSignature = '', lastMessages = [], lastResult = null;
+const context = () => globalThis.SillyTavern?.getContext?.();
+const number = n => n.toLocaleString('en-US');
+const yieldUI = () => new Promise(resolve => setTimeout(resolve, 0));
+function row() { return document.querySelector(SELECTOR); }
+function visible(el) { return !!el?.isConnected && el.getClientRects().length > 0 && !document.hidden; }
+function badge(el) {
     const name = el.querySelector('[data-pm-name], .completion_prompt_manager_prompt_name');
-    if (!name) return;
-    let b = name.querySelector(`.${BADGE}`);
-    if (!b) {
-        b = document.createElement('span'); b.className = BADGE;
-        b.setAttribute('role','button'); b.tabIndex = 0;
-        b.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); showStatus(); });
-        b.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); showStatus(); } });
-        name.append(b);
-        // Keep this label out of the name's single-line ellipsis on mobile.
-        for (const [k,v] of Object.entries({'display':'block','white-space':'normal','overflow-wrap':'anywhere','margin-inline-start':'0','margin-top':'2px','font-size':'.72em','line-height':'1.2','color':'#c7c7c7','opacity':'1','cursor':'pointer'})) b.style.setProperty(k,v,'important');
-        name.style.setProperty('white-space','normal','important');
-        name.style.setProperty('overflow','visible','important');
+    if (!name) return null;
+    let span = name.querySelector(`.${BADGE}`);
+    if (!span) {
+        span = document.createElement('span');
+        span.className = BADGE;
+        span.setAttribute('aria-live', 'off');
+        name.append(span);
     }
-    if (b.textContent !== status.label) b.textContent = status.label;
-    b.title = status.detail; b.setAttribute('aria-label',`Recap Savings: ${status.detail}`);
+    return span;
 }
-function showStatus() { window.alert(`Recap Savings ${VERSION}\n\n${status.detail}`); if (!busy) schedule(); }
-function setStatus(label,detail) { status = {label,detail}; render(); }
+function render(el, result) {
+    const b = badge(el);
+    if (!b) return;
+    const label = result ? `−${compact(result.saved)} tok` : '…';
+    if (b.textContent !== label) b.textContent = label;
+    const title = result
+        ? `Recap savings: approx. ${number(result.saved)} tokens across ${result.posts} compressed assistant posts in the eligible full chat. Compares the same prompt-only regex pipeline with/without the Russian Narrative saver. Excludes header and pose savings. Not a provider bill or exact final context count; context limits may exclude old messages.`
+        : 'Calculating recap savings…';
+    if (b.title !== title) b.title = title;
+}
+function clear(el) { el?.querySelector(`.${BADGE}`)?.remove(); }
 function schedule(invalidate = true) {
     if (invalidate) revision++;
-    pending = true; clearTimeout(timer); timer = setTimeout(refresh, 300);
+    pending = true;
+    clearTimeout(timer);
+    timer = setTimeout(refresh, 300);
 }
-async function loadDeps() {
-    if (deps) return deps;
-    if (!loading) loading = Promise.all([
-        import('../../regex/engine.js'), import('../../../tokenizers.js'), import('../../../../script.js'), import('../../../group-chats.js'), import('../../../extensions.js')
-    ]).then(([regex,token,main,group,ext]) => {
-        if (typeof regex.getRegexScripts !== 'function' || typeof regex.runRegexScript !== 'function' || typeof token.countTokensOpenAIAsync !== 'function' || typeof token.getTokenizerModel !== 'function') throw Error('Required SillyTavern API is missing');
-        deps = {regex,token,main,group,ext}; return deps;
-    }).catch(e => { loading = null; throw e; });
-    return loading;
-}
-let subscribed = false;
-function subscribe(ctx) {
-    if (subscribed || !ctx?.eventSource?.on) return;
-    subscribed = true;
-    const events = ctx.eventTypes || ctx.event_types || {};
-    for (const key of ['CHAT_CHANGED','MESSAGE_RECEIVED','MESSAGE_SENT','MESSAGE_EDITED','MESSAGE_DELETED','MESSAGE_SWIPED','OAI_PRESET_CHANGED','CHATCOMPLETION_SOURCE_CHANGED','CHATCOMPLETION_MODEL_CHANGED','SETTINGS_UPDATED','GENERATION_ENDED','GENERATION_STOPPED']) {
-        if (events[key]) ctx.eventSource.on(events[key], () => schedule());
-    }
-    if (events.GENERATION_STARTED) ctx.eventSource.on(events.GENERATION_STARTED, (...args) => { if (args[2] !== true) { revision++; pending = true; } });
+function sameMessages(a, b) {
+    return a.length === b.length && a.every((x,i) => x.text === b[i].text && x.user === b[i].user);
 }
 async function refresh() {
-    if (busy) return;
-    const el = row(); if (!el) return;
-    if (generating()) { setStatus('Waiting…','Generation is running; savings will refresh when it ends.'); return; }
-    busy = true; pending = false;
+    if (busy || generating()) return;
+    pending = false;
+    const el = row(), ctx = context();
+    if (!visible(el) || !ctx || ctx.mainApi !== 'openai') return;
+    if (el.className.includes('prompt_manager_prompt_disabled')) { clear(el); return; }
+    let scripts;
+    try { scripts = ctx.extensionSettings?.disabledExtensions?.includes('regex') ? [] : getRegexScripts({ allowedOnly: true }); }
+    catch (e) { clear(el); console.warn('[Sola Recap Savings] Regex unavailable', e); return; }
+    scripts = scripts.filter(s => !s.disabled && s.promptOnly && s.placement?.includes(2));
+    if (!scripts.some(isSaver)) { clear(el); lastResult = null; lastSignature = ''; return; }
+    const chatKey = JSON.stringify([ctx.groupId, ctx.characterId, ctx.chatId, ctx.getCurrentChatId?.(), getTokenizerModel()]);
+    if (session !== chatKey) { session = chatKey; cache.clear(); lastResult = null; lastSignature = ''; }
+    // System/hidden messages are excluded like the regular prompt builder.
+    const messages = (ctx.chat || []).filter(m => !m.is_system).map(m => ({text: String(m.mes ?? ''), user: !!m.is_user}));
+    const sig = JSON.stringify(scripts);
+    if (lastResult && !scripts.some(s => /\{\{/.test(`${s.findRegex} ${s.replaceString}`)) && sig === lastSignature && sameMessages(messages,lastMessages)) { render(el,lastResult); return; }
+    busy = true;
     const runRevision = revision;
-    const cancelled = () => revision !== runRevision || generating() || !row();
-    let phase = 'Loading extension API';
+    const cancelled = () => revision !== runRevision || generating() || !visible(row());
+    render(el, null);
     try {
-        const {regex,token,main,ext} = await loadDeps();
-        if (cancelled()) return;
-        phase = 'Getting SillyTavern context';
-        const ctx = ext.getContext?.() || globalThis.SillyTavern?.getContext?.();
-        if (!ctx) { setStatus('No context','SillyTavern context is not ready. Tap this label to retry.'); return; }
-        subscribe(ctx);
-        if ((ctx.mainApi ?? main.main_api) !== 'openai') { setStatus('Wrong API','Recap Savings supports Chat Completion (OpenAI-compatible) only. Current API: '+String(ctx.mainApi ?? main.main_api)); return; }
-        if (el.className.includes('prompt_manager_prompt_disabled')) { setStatus('History off','Chat History is disabled.'); return; }
-        if (ctx.extensionSettings?.disabledExtensions?.includes('regex')) { setStatus('Regex off','The Regex extension is disabled.'); return; }
-        phase = 'Reading active regex rules';
-        const all = regex.getRegexScripts({allowedOnly:false});
-        const allowed = regex.getRegexScripts({allowedOnly:true});
-        const scripts = allowed.filter(s => !s.disabled && s.promptOnly && s.placement?.includes(2));
-        if (!scripts.some(isSaver)) {
-            lastResult = null; lastSignature = '';
-            const found = all.filter(isSaver), permitted = allowed.filter(isSaver);
-            if (!found.length) setStatus('Saver missing','Russian Narrative Saver was not found. Import the original rule in Global Regex.');
-            else if (!permitted.length) setStatus('Saver blocked','Saver exists, but its character/preset Regex scope is not allowed.');
-            else if (permitted.every(s=>s.disabled)) setStatus('Saver disabled','Russian Narrative Saver is disabled.');
-            else setStatus('Saver settings','Saver must be enabled for AI Output and Alter Outgoing Prompt.');
-            return;
-        }
-        phase = 'Preparing messages';
-        const chatKey = JSON.stringify([ctx.groupId,ctx.characterId,ctx.chatId,ctx.getCurrentChatId?.(),token.getTokenizerModel()]);
-        if (session !== chatKey) { session = chatKey; cache.clear(); lastResult = null; lastSignature = ''; }
-        const messages = (ctx.chat || []).filter(m=>!m.is_system).map(m=>({text:String(m.mes ?? ''),user:!!m.is_user}));
-        const sig = JSON.stringify(scripts), dynamic = scripts.some(s=>/\{\{/.test(`${s.findRegex} ${s.replaceString}`));
-        const report = result => setStatus(result.posts ? `−${compact(result.saved)} tok` : '0 tok · no matches', `Approx. ${result.saved.toLocaleString('en-US')} tokens saved across ${result.posts} changed assistant posts in the full eligible chat. ${result.candidates} posts contained a Russian block. Not the provider bill or exact current prompt. Tap to refresh.`);
-        if (lastResult && !dynamic && sig===lastSignature && messages.length===lastMessages.length && messages.every((m,i)=>m.text===lastMessages[i].text && m.user===lastMessages[i].user)) { report(lastResult); return; }
-        setStatus('Calculating…','Comparing existing prompt-only Regex rules with and without the Saver.');
-        let saved=0, posts=0, candidates=0;
-        for (let i=0;i<messages.length;i++) {
+        let saved = 0, posts = 0;
+        for (let i = 0; i < messages.length; i++) {
             if (cancelled()) return;
-            const m=messages[i], depth=messages.length-i-1;
+            const m = messages[i], depth = messages.length - i - 1;
             if (m.user || !/<ru\s*>/i.test(m.text)) continue;
-            candidates++;
-            const active=scripts.filter(s=>applicable(s,depth));
+            const active = scripts.filter(s => applicable(s, depth));
             if (!active.some(isSaver)) continue;
-            const key=JSON.stringify(active), hasMacros=active.some(s=>/\{\{/.test(`${s.findRegex} ${s.replaceString}`));
-            let entry=cache.get(i);
-            if (!entry || entry.text!==m.text || entry.key!==key || hasMacros) {
-                phase='Applying prompt-only Regex';
-                let before=m.text, after=m.text;
-                for (const s of active) { if (!isSaver(s)) before=regex.runRegexScript(s,before); after=regex.runRegexScript(s,after); }
-                let delta=0, changed=before!==after;
-                if (changed) {
-                    phase='Counting tokens';
-                    const a=await token.countTokensOpenAIAsync({role:'assistant',content:before},true);
+            const key = JSON.stringify(active.map(s => [s.id, s.scriptName, s.findRegex, s.replaceString, s.trimStrings, s.substituteRegex]));
+            let entry = cache.get(i);
+            // Reuse old posts only if text and active rules match. Macro-bearing rules
+            // may depend on external state, so do not cache their comparisons.
+            const dynamic = active.some(s => /\{\{/.test(`${s.findRegex} ${s.replaceString}`));
+            if (!entry || entry.text !== m.text || entry.key !== key || dynamic) {
+                const pair = compare(m.text, active, depth, runRegexScript);
+                let delta = 0;
+                if (pair) {
+                    const before = await countTokensOpenAIAsync({role:'assistant',content:pair.before}, true);
                     if (cancelled()) return;
-                    const b=await token.countTokensOpenAIAsync({role:'assistant',content:after},true);
+                    const after = await countTokensOpenAIAsync({role:'assistant',content:pair.after}, true);
                     if (cancelled()) return;
-                    if (!Number.isFinite(a)||!Number.isFinite(b)) throw Error('Invalid tokenizer response');
-                    delta=a-b;
+                    if (!Number.isFinite(before) || !Number.isFinite(after)) throw Error('Invalid tokenizer response');
+                    delta = before - after;
                 }
-                entry={text:m.text,key,delta,changed}; if (!hasMacros) cache.set(i,entry);
+                entry = {text:m.text,key,delta,compressed:!!pair};
+                if (!dynamic) cache.set(i,entry);
             }
-            saved+=entry.delta; posts+=Number(entry.changed);
-            if (i%12===0) await new Promise(resolve=>setTimeout(resolve,0));
+            saved += entry.delta;
+            posts += Number(entry.compressed);
+            if (i % 12 === 0) await yieldUI();
         }
         if (cancelled()) return;
-        for (const i of cache.keys()) if (i>=messages.length) cache.delete(i);
-        lastResult={saved:Math.max(0,saved),posts,candidates}; lastSignature=sig; lastMessages=messages; report(lastResult);
-    } catch(e) { if (!cancelled()) setStatus('Recap error',`${phase}: ${errorText(e)}`); console.warn('[Recap Savings]',phase,e); }
-    finally { busy=false; if (pending && !generating()) schedule(false); }
+        for (const i of cache.keys()) if (i >= messages.length) cache.delete(i);
+        lastResult = {saved:Math.max(0,saved),posts};
+        lastSignature = sig; lastMessages = messages;
+        render(row(),lastResult);
+    } catch(e) {
+        console.warn('[Sola Recap Savings] Token count failed',e);
+        const b = row()?.querySelector(`.${BADGE}`);
+        if (b) { b.textContent = '— tok'; b.title = 'Tokenizer unavailable. Reopen Prompt Manager to retry.'; }
+    } finally {
+        busy = false;
+        if (pending) schedule(false);
+    }
 }
 function init() {
-    if (window.__solaRecapSavingsMobile103) return;
-    window.__solaRecapSavingsMobile103=true;
-    // Start UI independently of imports so failures can be displayed on Android.
-    setInterval(()=>{
-        const el=row(), active=generating();
-        if (el!==lastRow || (wasGenerating && !active)) { lastRow=el; if(el) { render(el); schedule(false); } }
-        else if (el && !el.querySelector(`.${BADGE}`)) render(el);
-        wasGenerating=active;
-    },500);
-    document.addEventListener('change',()=>{if(row()) schedule();},true);
-    document.addEventListener('visibilitychange',()=>{if(!document.hidden) schedule();});
+    const ctx = context();
+    if (!ctx) return;
+    const events = ctx.eventTypes || ctx.event_types || {};
+    for (const key of ['CHAT_CHANGED','MESSAGE_RECEIVED','MESSAGE_SENT','MESSAGE_EDITED','MESSAGE_DELETED','MESSAGE_SWIPED','OAI_PRESET_CHANGED','CHATCOMPLETION_SOURCE_CHANGED','CHATCOMPLETION_MODEL_CHANGED','SETTINGS_UPDATED','GENERATION_ENDED','GENERATION_STOPPED']) {
+        if (events[key]) ctx.eventSource.on(events[key], () => {
+            schedule();
+        });
+    }
+    if (events.GENERATION_STARTED) ctx.eventSource.on(events.GENERATION_STARTED, (...args) => {
+        // Ignore Prompt Manager dry runs (3rd argument on current ST).
+        if (args[2] === true) return;
+        revision++; pending = true;
+    });
+    // PM replaces its rows when it renders. A lightweight row check restores
+    // the badge without watching the whole chat or listening to stream tokens.
+    let wasVisible = false, wasGenerating = false;
+    setInterval(() => {
+        const el = row(), now = visible(el), active = generating();
+        if (el !== lastRow || now !== wasVisible || (wasGenerating && !active)) {
+            lastRow = el; wasVisible = now;
+            if (now) schedule(false);
+        }
+        wasGenerating = active;
+    }, 500);
+    // React to settings changes even if the installed ST version has no event for them.
+    document.addEventListener('change', () => { if (visible(row())) schedule(); }, true);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) schedule(false); });
     schedule(false);
 }
-if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',init,{once:true}); else init();
+// Extensions load after the main context is registered.
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded',init,{once:true});
+else init();
